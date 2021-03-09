@@ -3,7 +3,7 @@
 
 use super::{errno_str, Error};
 use libc::*;
-use spin::Mutex;
+use parking_lot::Mutex;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
@@ -99,6 +99,7 @@ impl<H: Sync + Send> EventPoll<H> {
     /// Add and enable a new write event with the factory.
     /// The event is triggered when a Write operation on the provided trigger becomes possible
     /// For TCP sockets it means that the socket was succesfully connected
+    #[allow(dead_code)]
     pub fn new_write_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
         // Create an event descriptor
         let flags = EPOLLOUT | EPOLLET | EPOLLONESHOT;
@@ -132,7 +133,7 @@ impl<H: Sync + Send> EventPoll<H> {
 
         let ts = timespec {
             tv_sec: period.as_secs() as _,
-            tv_nsec: period.subsec_nanos() as _,
+            tv_nsec: i64::from(period.subsec_nanos()) as _,
         };
 
         let spec = itimerspec {
@@ -194,7 +195,7 @@ impl<H: Sync + Send> EventPoll<H> {
             let mut sigset = std::mem::zeroed();
             sigemptyset(&mut sigset);
             sigaddset(&mut sigset, signal);
-            sigprocmask(SIG_BLOCK, &mut sigset, null_mut());
+            sigprocmask(SIG_BLOCK, &sigset, null_mut());
             signalfd(-1, &sigset, SFD_NONBLOCK)
         } {
             -1 => return Err(Error::EventQueue(errno_str())),
@@ -219,10 +220,12 @@ impl<H: Sync + Send> EventPoll<H> {
     /// is triggered, a single caller thread gets the handler for that event.
     /// In case a notifier is triggered, all waiting threads will receive the same
     /// handler.
-    pub fn wait<'a>(&'a self) -> WaitResult<'a, H> {
+    pub fn wait(&self) -> WaitResult<'_, H> {
         let mut event = epoll_event { events: 0, u64: 0 };
-        if unsafe { epoll_wait(self.epoll, &mut event, 1, -1) } == -1 {
-            return WaitResult::Error(errno_str());
+        match unsafe { epoll_wait(self.epoll, &mut event, 1, -1) } {
+            -1 => return WaitResult::Error(errno_str()),
+            1 => {}
+            _ => return WaitResult::Error("unexpected number of events returned".to_string()),
         }
 
         let event_data = unsafe { (event.u64 as *mut Event<H>).as_mut().unwrap() };
@@ -333,7 +336,7 @@ impl<H> EventPoll<H> {
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
         let mut events = self.events.lock();
         assert!(index >= 0);
-        if let Some(_) = events[index as usize].take() {
+        if events[index as usize].take().is_some() {
             epoll_ctl(self.epoll, EPOLL_CTL_DEL, index, null_mut());
         }
     }
@@ -350,7 +353,8 @@ impl<'a, H> Drop for EventGuard<'a, H> {
     fn drop(&mut self) {
         if self.event.needs_read {
             // Must read from the event to reset it before we enable it
-            let mut buf: [u8; 256] = unsafe { std::mem::uninitialized() };
+            let mut buf: [std::mem::MaybeUninit<u8>; 256] =
+                unsafe { std::mem::MaybeUninit::uninit().assume_init() };
             while unsafe { read(self.event.fd, buf.as_mut_ptr() as _, buf.len() as _) } != -1 {}
         }
 
@@ -359,7 +363,7 @@ impl<'a, H> Drop for EventGuard<'a, H> {
                 self.epoll,
                 EPOLL_CTL_MOD,
                 self.event.fd,
-                &mut self.event.event.clone(),
+                &mut self.event.event,
             );
         }
     }
@@ -367,6 +371,7 @@ impl<'a, H> Drop for EventGuard<'a, H> {
 
 impl<'a, H> EventGuard<'a, H> {
     /// Get a mutable reference to the stored value
+    #[allow(dead_code)]
     pub fn get_mut(&mut self) -> &mut H {
         &mut self.event.handler
     }
@@ -375,5 +380,29 @@ impl<'a, H> EventGuard<'a, H> {
     pub fn cancel(self) {
         unsafe { self.poll.clear_event_by_fd(self.event.fd) };
         std::mem::forget(self); // Don't call the regular drop that would enable the event
+    }
+
+    /// Change the event flags to enable or disable notifying when the fd is writable
+    pub fn notify_writable(&mut self, enabled: bool) {
+        let flags = if enabled {
+            EPOLLOUT | EPOLLIN | EPOLLET | EPOLLONESHOT
+        } else {
+            EPOLLIN | EPOLLONESHOT
+        };
+        self.event.event.events = flags as _;
+    }
+}
+
+pub fn block_signal(signal: c_int) -> Result<sigset_t, String> {
+    unsafe {
+        let mut sigset = std::mem::zeroed();
+        sigemptyset(&mut sigset);
+        if sigaddset(&mut sigset, signal) == -1 {
+            return Err(errno_str());
+        }
+        if sigprocmask(SIG_BLOCK, &sigset, null_mut()) == -1 {
+            return Err(errno_str());
+        }
+        Ok(sigset)
     }
 }
